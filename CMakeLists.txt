@@ -10,7 +10,7 @@ else() # Windows
 endif()
 
 cmake_minimum_required(VERSION 3.10.0)
-project(WaveformXmode VERSION 1.0.0 LANGUAGES CXX)
+project(WaveformXmode VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

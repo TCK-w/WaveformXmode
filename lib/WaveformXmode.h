@@ -61,6 +61,12 @@ extern "C" DPCPP_DLL_API void xmode(void* p, const char* num_list, int xmode);
 extern "C" DPCPP_DLL_API void execute(void* p);
 
 //************************************
+// Execute the calculation in parallel mode. (Overlap data transfer and computation)
+// Note: Might take more RAM. 
+//************************************
+extern "C" DPCPP_DLL_API void execute_p(void* p);
+
+//************************************
 // Get the used waveforms. `num` is the number of columns in pattern.
 //************************************
 extern "C" DPCPP_DLL_API char* get_used(void* p, int num);

@@ -32,14 +32,15 @@ private:
     std::vector<std::vector<char>*> wave;
     std::vector<int> xmode;
     std::vector<std::vector<char>*> res;
-    void wave_search(queue& q, std::vector<char>& wave, int x, std::vector<char>& re);
+    void wave_search(queue& q);
+    void wave_search_p(queue& q);
 public:
     WaveformXmode(std::vector<std::vector<char>*> wave);
     WaveformXmode();
     ~WaveformXmode();
     void set_w(std::vector<std::vector<char>*>& wave);
     void set_xmode(const std::vector<int>& num_list, int xmode);
-    void execute();
+    void execute(int para = 0);
     std::vector<std::string> get_result(int num);
     std::string get_w(const std::vector<int>& num_list);
 };
@@ -108,186 +109,319 @@ void WaveformXmode::set_xmode(const std::vector<int>& num_list, int xmode) {
     this->safe = false;
 }
 
-void WaveformXmode::wave_search(queue& q, std::vector<char>& wave, int x, std::vector<char>& re) {
-    unsigned int local_s = 256 * x;
+void WaveformXmode::wave_search(queue& q) {
+    constexpr unsigned int sg_s = 8;
     constexpr unsigned int thrd = 64;
-    constexpr unsigned int arr_s = 16;
-    unsigned int w_s = (wave.size() / x) * x;
-    unsigned int re_s = re.size();
-    unsigned int w_com = (w_s / (arr_s * x)) * (arr_s * x);
-    unsigned int w_rest = w_s % (arr_s * x);
 
-    char* w_host = wave.data();
-    char* re_host = re.data();
+    int n = 0;
+    std::vector<void*> dev_p;
+    for (std::vector<int>::iterator it = this->xmode.begin(); it != this->xmode.end(); it++) {
+        if (*it != 0) {
+            if (this->res.at(n) != nullptr) {
+                std::vector<char>* tmp = this->res.at(n);
+                this->res.at(n) = nullptr;
+                delete tmp;
+            }
+            unsigned int x = *it;
+            std::vector<char>* re = new std::vector<char>(256 * x, 0);
+            this->res.at(n) = re;
+            std::vector<char>* wave = this->wave.at(n);
 
-    char* w_dev = malloc_device<char>(w_s, q);
-    char* buf_dev = malloc_device<char>(local_s * thrd, q);
-    char* re_dev = malloc_device<char>(re_s, q);
-    unsigned int* len_dev = malloc_device<unsigned int>(thrd, q);
-    q.memcpy(w_dev, w_host, sizeof(char) * w_s).wait();
+            // kernel
+            unsigned int local_s = 256 * x;
+            unsigned int w_s = (wave->size() / x) * x;
+            unsigned int re_s = re->size();
 
-    q.submit([&](handler& h) {
+            char* w_host = wave->data();
+            char* re_host = re->data();
+            sycl::ext::oneapi::experimental::prepare_for_device_copy(w_host, sizeof(char) * w_s, q);
+            char* w_dev = malloc_device<char>(w_s, q);
+            char* buf_dev = malloc_device<char>(local_s * thrd, q);
+            unsigned int* len_dev = malloc_device<unsigned int>(thrd, q);
+            q.memcpy(w_dev, w_host, sizeof(char) * w_s).wait();
+            sycl::ext::oneapi::experimental::release_from_device_copy(w_host, q);
 
-        local_accessor<char, 1> local_re(sycl::range(local_s), h);
-        //sycl::stream out(65536, 256, h);
-        h.parallel_for(sycl::nd_range(sycl::range{ x * thrd }, sycl::range{ x }), [=](sycl::nd_item<1> it) {
-            unsigned int groupId = it.get_group(0);
-            unsigned int globalId = it.get_global_linear_id();
-            auto sg = it.get_sub_group();
-            unsigned int sgSize = sg.get_local_range()[0];
-            unsigned int sgGroupId = sg.get_group_id()[0];
-            unsigned int sgId = sg.get_local_id()[0];
+            q.submit([&](handler& h) {
+                local_accessor<char, 1> local_re(sycl::range(local_s), h);
+                //sycl::stream out(65536, 256, h);
+                h.parallel_for(sycl::nd_range(sycl::range{ sg_s * thrd }, sycl::range{ sg_s }), [=](sycl::nd_item<1> it) [[intel::reqd_sub_group_size(sg_s)]] {
+                    unsigned int groupId = it.get_group(0);
+                    unsigned int globalId = it.get_global_linear_id();
+                    auto sg = it.get_sub_group();
+                    unsigned int sgSize = sg.get_local_range()[0];
+                    unsigned int sgGroupId = sg.get_group_id()[0];
+                    unsigned int sgId = sg.get_local_id()[0];
 
-            unsigned int local_idx = 0;
-            char arr[arr_s];
-            bool check_tot;
-            bool check_once;
-            bool check_cur;
-            for (unsigned int i = groupId * x * arr_s;i < w_com;i += thrd * x * arr_s) {
-#pragma unroll
-                for (unsigned int j = 0; j < arr_s; j++) {
-                    arr[j] = w_dev[i + sgId + j * x];
-                }
-                it.barrier(sycl::access::fence_space::local_space);
-#pragma unroll
-                for (unsigned int j = 0; j < arr_s; j++) {
-                    check_tot = false;
-                    char cur = arr[j];
-                    for (unsigned int k = sgId;k < local_idx;k += x) {
-                        check_once = true;
-                        check_cur = (local_re[k] == cur);
+                    bool check_tot = false;
+                    unsigned int local_idx = 0;
+                    for (unsigned int i = groupId * x;i < w_s;i += thrd * x) {
+                        check_tot = false;
+                        for (unsigned int j = sgId * x;j < sycl::select_from_group(sg, local_idx, 0);j += sg_s * x) {
+                            bool check_once = true;
+                            for (unsigned int k = 0;k < x;k++) {
+                                check_once = check_once & (w_dev[i + k] == local_re[j + k]);
+                            }
+                            it.barrier(sycl::access::fence_space::local_space);
+
+                            check_tot = check_tot | reduce_over_group(sg, check_once, sycl::logical_or<bool>());
+                            if (sycl::select_from_group(sg, check_tot, 0)) {
+                                break;
+                            }
+                        }
+                        if (sgId == 0 && (!check_tot)) {
+                            for (unsigned int k = 0;k < x;k++) {
+                                local_re[local_idx + k] = w_dev[i + k];
+                            }
+                            local_idx += x;
+                        }
                         it.barrier(sycl::access::fence_space::local_space);
-                        for (size_t ki = 0;ki < x;ki++) {
-                            check_once = check_once & sycl::select_from_group(sg, check_cur, ki);
-                        }
-                        check_tot = check_tot | check_once;
-                        if (check_tot) {
-                            break;
-                        }
                     }
-                    if (!check_tot) {
-                        local_re[local_idx + sgId] = cur;
-                        local_idx += x;
+                    for (unsigned int k = sgId;k < sycl::select_from_group(sg, local_idx, 0);k += sgSize) {
+                        buf_dev[groupId * local_s + k] = local_re[k];
+                    }
+                    for (unsigned int k = sycl::select_from_group(sg, local_idx, 0) + sgId;k < local_s;k += sgSize) {
+                        buf_dev[groupId * local_s + k] = 0;
+                    }
+                    if (sgId == 0) {
+                        len_dev[groupId] = local_idx;
+                    }
+
+                    //out << "globalId = " << sycl::setw(2) << globalId
+                    //    << " groupId = " << groupId
+                    //    << " sgGroupId = " << sgGroupId << " sgId = " << sgId
+                    //    << " sgSize = " << sycl::setw(2) << sgSize
+                    //    << " debug = " << sycl::setw(2) << check_tot
+                    //    << sycl::endl;
+                });
+            });
+            q.wait();
+
+            q.submit([&](handler& h) {
+                local_accessor<char, 1> local_re(sycl::range(local_s), h);
+                //sycl::stream out(65536, 256, h);
+                h.parallel_for(sycl::nd_range(sycl::range{ sg_s }, sycl::range{ sg_s }), [=](sycl::nd_item<1> it) [[intel::reqd_sub_group_size(sg_s)]] {
+                    unsigned int groupId = it.get_group(0);
+                    unsigned int globalId = it.get_global_linear_id();
+                    auto sg = it.get_sub_group();
+                    unsigned int sgSize = sg.get_local_range()[0];
+                    unsigned int sgGroupId = sg.get_group_id()[0];
+                    unsigned int sgId = sg.get_local_id()[0];
+
+                    unsigned int local_idx = len_dev[0];
+                    for (unsigned int k = sgId;k < local_s;k += sgSize) {
+                        local_re[k] = buf_dev[k];
                     }
                     it.barrier(sycl::access::fence_space::local_space);
-                }
-            }
-            for (unsigned int k = sgId;k < local_idx;k += x) {
-                buf_dev[groupId * local_s + k] = local_re[k];
-            }
-            for (unsigned int k = local_idx + sgId;k < local_s;k += x) {
-                buf_dev[groupId * local_s + k] = 0;
-            }
-            if (sgId == 0) {
-                len_dev[groupId] = local_idx;
-            }
-            it.barrier(sycl::access::fence_space::local_space);
 
-            //out << "globalId = " << sycl::setw(2) << globalId
-            //    << " groupId = " << groupId
-            //    << " sgGroupId = " << sgGroupId << " sgId = " << sgId
-            //    << " sgSize = " << sycl::setw(2) << sgSize
-            //    << sycl::endl;
-            });
+                    for (unsigned int t = 1; t < thrd;t++) {
+                        for (unsigned int i = t * local_s;i < t * local_s + len_dev[t];i += x) {
+                            bool check_tot = false;
+                            for (unsigned int j = sgId * x;j < sycl::select_from_group(sg, local_idx, 0);j += sg_s * x) {
+                                bool check_once = true;
+                                for (unsigned int k = 0;k < x;k++) {
+                                    check_once = check_once & (buf_dev[i + k] == local_re[j + k]);
+                                }
+                                it.barrier(sycl::access::fence_space::local_space);
 
-        });
-    q.wait();
-
-    q.submit([&](handler& h) {
-
-        local_accessor<char, 1> local_re(sycl::range(local_s), h);
-        //sycl::stream out(65536, 256, h);
-        h.parallel_for(sycl::nd_range(sycl::range{ x }, sycl::range{ x }), [=](sycl::nd_item<1> it) {
-            unsigned int groupId = it.get_group(0);
-            unsigned int globalId = it.get_global_linear_id();
-            auto sg = it.get_sub_group();
-            unsigned int sgSize = sg.get_local_range()[0];
-            unsigned int sgGroupId = sg.get_group_id()[0];
-            unsigned int sgId = sg.get_local_id()[0];
-
-            unsigned int local_idx = len_dev[0];
-            for (unsigned int j = 0; j < local_s; j+=x) {
-                local_re[sgId + j] = buf_dev[sgId + j];
-            }
-            it.barrier(sycl::access::fence_space::local_space);
-
-            bool check_tot;
-            bool check_once;
-            bool check_cur;
-#pragma unroll
-            for (unsigned int i = 0; i < thrd; i++) {
-                if (i == 0) {
-                    for (unsigned int j = 0; j < w_rest; j+=x) {
-                        check_tot = false;
-                        char cur = w_dev[w_com + sgId + j];
-                        for (unsigned int k = sgId;k < local_idx;k += x) {
-                            check_once = true;
-                            check_cur = (local_re[k] == cur);
+                                check_tot = check_tot | reduce_over_group(sg, check_once, sycl::logical_or<bool>());
+                                if (sycl::select_from_group(sg, check_tot, 0)) {
+                                    break;
+                                }
+                            }
+                            if (sgId == 0 && (!check_tot)) {
+                                for (unsigned int k = 0;k < x;k++) {
+                                    local_re[local_idx + k] = buf_dev[i + k];
+                                }
+                                local_idx += x;
+                            }
                             it.barrier(sycl::access::fence_space::local_space);
-                            for (size_t ki = 0;ki < x;ki++) {
-                                check_once = check_once & sycl::select_from_group(sg, check_cur, ki);
-                            }
-                            check_tot = check_tot | check_once;
-                            if (check_tot) {
-                                break;
-                            }
                         }
-                        if (!check_tot) {
-                            local_re[local_idx + sgId] = cur;
-                            local_idx += x;
-                        }
-                        it.barrier(sycl::access::fence_space::local_space);
                     }
-                }
-                else {
-                    for (unsigned int j = 0; j < len_dev[i]; j+=x) {
-                        check_tot = false;
-                        char cur = buf_dev[local_s * i + sgId + j];
-                        for (unsigned int k = sgId;k < local_idx;k += x) {
-                            check_once = true;
-                            check_cur = (local_re[k] == cur);
-                            it.barrier(sycl::access::fence_space::local_space);
-                            for (size_t ki = 0;ki < x;ki++) {
-                                check_once = check_once & sycl::select_from_group(sg, check_cur, ki);
-                            }
-                            check_tot = check_tot | check_once;
-                            if (check_tot) {
-                                break;
-                            }
-                        }
-                        if (!check_tot) {
-                            local_re[local_idx + sgId] = cur;
-                            local_idx += x;
-                        }
-                        it.barrier(sycl::access::fence_space::local_space);
+                    for (unsigned int k = sgId;k < local_s;k += sgSize) {
+                        buf_dev[k] = local_re[k];
                     }
-                }
-            }
 
-            for (unsigned int j = 0; j < local_s ; j+=x) {
-                re_dev[sgId + j] = local_re[sgId + j];
-            }
-            it.barrier(sycl::access::fence_space::local_space);
-
-            //out << "globalId = " << sycl::setw(2) << globalId
-            //    << " groupId = " << groupId
-            //    << " sgGroupId = " << sgGroupId << " sgId = " << sgId
-            //    << " sgSize = " << sycl::setw(2) << sgSize
-            //    << sycl::endl;
+                    //out << "globalId = " << sycl::setw(2) << globalId
+                    //    << " groupId = " << groupId
+                    //    << " sgGroupId = " << sgGroupId << " sgId = " << sgId
+                    //    << " sgSize = " << sycl::setw(2) << sgSize
+                    //    << sycl::endl;
+                });
             });
+            q.wait();
 
-        });
-    q.wait();
-    
-    q.memcpy(re_host, re_dev, sizeof(char) * re_s).wait();
+            sycl::ext::oneapi::experimental::prepare_for_device_copy(re_host, sizeof(char) * re_s, q);
+            q.memcpy(re_host, buf_dev, sizeof(char) * re_s).wait();
+            sycl::ext::oneapi::experimental::release_from_device_copy(re_host, q);
 
-    free(w_dev, q);
-    free(buf_dev, q);
-    free(len_dev, q);
-    free(re_dev, q);
+            free(w_dev, q);
+            free(buf_dev, q);
+            free(len_dev, q);
+        }
+        n++;
+    }
 }
 
-void WaveformXmode::execute() {
+void WaveformXmode::wave_search_p(queue& q) {
+    constexpr unsigned int sg_s = 8;
+    constexpr unsigned int thrd = 64;
+
+    int n = 0;
+    std::vector<void*> dev_p;
+    for (std::vector<int>::iterator it = this->xmode.begin(); it != this->xmode.end(); it++) {
+        if (*it != 0) {
+            if (this->res.at(n) != nullptr) {
+                std::vector<char>* tmp = this->res.at(n);
+                this->res.at(n) = nullptr;
+                delete tmp;
+            }
+            unsigned int x = *it;
+            std::vector<char>* re = new std::vector<char>(256 * x, 0);
+            this->res.at(n) = re;
+            std::vector<char>* wave = this->wave.at(n);
+
+            // kernel
+            unsigned int local_s = 256 * x;
+            unsigned int w_s = (wave->size() / x) * x;
+            unsigned int re_s = re->size();
+
+            char* w_host = wave->data();
+            char* re_host = re->data();
+            char* w_dev = malloc_device<char>(w_s, q);
+            dev_p.push_back(w_dev);
+            char* buf_dev = malloc_device<char>(local_s * thrd, q);
+            dev_p.push_back(buf_dev);
+            unsigned int* len_dev = malloc_device<unsigned int>(thrd, q);
+            dev_p.push_back(len_dev);
+            event copy_in = q.memcpy(w_dev, w_host, sizeof(char) * w_s);
+
+            event e1 = q.submit([&](handler& h) {
+                h.depends_on(copy_in);
+                local_accessor<char, 1> local_re(sycl::range(local_s), h);
+                //sycl::stream out(65536, 256, h);
+                h.parallel_for(sycl::nd_range(sycl::range{ sg_s * thrd }, sycl::range{ sg_s }), [=](sycl::nd_item<1> it) [[intel::reqd_sub_group_size(sg_s)]] {
+                    unsigned int groupId = it.get_group(0);
+                    unsigned int globalId = it.get_global_linear_id();
+                    auto sg = it.get_sub_group();
+                    unsigned int sgSize = sg.get_local_range()[0];
+                    unsigned int sgGroupId = sg.get_group_id()[0];
+                    unsigned int sgId = sg.get_local_id()[0];
+
+                    bool check_tot = false;
+                    unsigned int local_idx = 0;
+                    for (unsigned int i = groupId * x;i < w_s;i += thrd * x) {
+                        check_tot = false;
+                        for (unsigned int j = sgId * x;j < sycl::select_from_group(sg, local_idx, 0);j += sg_s * x) {
+                            bool check_once = true;
+                            for (unsigned int k = 0;k < x;k++) {
+                                check_once = check_once & (w_dev[i + k] == local_re[j + k]);
+                            }
+                            it.barrier(sycl::access::fence_space::local_space);
+
+                            check_tot = check_tot | reduce_over_group(sg, check_once, sycl::logical_or<bool>());
+                            if (sycl::select_from_group(sg, check_tot, 0)) {
+                                break;
+                            }
+                        }
+                        if (sgId == 0 && (!check_tot)) {
+                            for (unsigned int k = 0;k < x;k++) {
+                                local_re[local_idx + k] = w_dev[i + k];
+                            }
+                            local_idx += x;
+                        }
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+                    for (unsigned int k = sgId;k < sycl::select_from_group(sg, local_idx, 0);k += sgSize) {
+                        buf_dev[groupId * local_s + k] = local_re[k];
+                    }
+                    for (unsigned int k = sycl::select_from_group(sg, local_idx, 0) + sgId;k < local_s;k += sgSize) {
+                        buf_dev[groupId * local_s + k] = 0;
+                    }
+                    if (sgId == 0) {
+                        len_dev[groupId] = local_idx;
+                    }
+
+                    //out << "globalId = " << sycl::setw(2) << globalId
+                    //    << " groupId = " << groupId
+                    //    << " sgGroupId = " << sgGroupId << " sgId = " << sgId
+                    //    << " sgSize = " << sycl::setw(2) << sgSize
+                    //    << " debug = " << sycl::setw(2) << check_tot
+                    //    << sycl::endl;
+                });
+            });
+
+            event e2 = q.submit([&](handler& h) {
+                h.depends_on(e1);
+                local_accessor<char, 1> local_re(sycl::range(local_s), h);
+                //sycl::stream out(65536, 256, h);
+                h.parallel_for(sycl::nd_range(sycl::range{ sg_s }, sycl::range{ sg_s }), [=](sycl::nd_item<1> it) [[intel::reqd_sub_group_size(sg_s)]] {
+                    unsigned int groupId = it.get_group(0);
+                    unsigned int globalId = it.get_global_linear_id();
+                    auto sg = it.get_sub_group();
+                    unsigned int sgSize = sg.get_local_range()[0];
+                    unsigned int sgGroupId = sg.get_group_id()[0];
+                    unsigned int sgId = sg.get_local_id()[0];
+
+                    unsigned int local_idx = len_dev[0];
+                    for (unsigned int k = sgId;k < local_s;k += sgSize) {
+                        local_re[k] = buf_dev[k];
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    for (unsigned int t = 1; t < thrd;t++) {
+                        for (unsigned int i = t * local_s;i < t * local_s + len_dev[t];i += x) {
+                            bool check_tot = false;
+                            for (unsigned int j = sgId * x;j < sycl::select_from_group(sg, local_idx, 0);j += sg_s * x) {
+                                bool check_once = true;
+                                for (unsigned int k = 0;k < x;k++) {
+                                    check_once = check_once & (buf_dev[i + k] == local_re[j + k]);
+                                }
+                                it.barrier(sycl::access::fence_space::local_space);
+
+                                check_tot = check_tot | reduce_over_group(sg, check_once, sycl::logical_or<bool>());
+                                if (sycl::select_from_group(sg, check_tot, 0)) {
+                                    break;
+                                }
+                            }
+                            if (sgId == 0 && (!check_tot)) {
+                                for (unsigned int k = 0;k < x;k++) {
+                                    local_re[local_idx + k] = buf_dev[i + k];
+                                }
+                                local_idx += x;
+                            }
+                            it.barrier(sycl::access::fence_space::local_space);
+                        }
+                    }
+                    for (unsigned int k = sgId;k < local_s;k += sgSize) {
+                        buf_dev[k] = local_re[k];
+                    }
+
+                    //out << "globalId = " << sycl::setw(2) << globalId
+                    //    << " groupId = " << groupId
+                    //    << " sgGroupId = " << sgGroupId << " sgId = " << sgId
+                    //    << " sgSize = " << sycl::setw(2) << sgSize
+                    //    << sycl::endl;
+                });
+            });
+
+            auto cg = [=](handler& h) {
+                h.depends_on(e2);
+                h.memcpy(re_host, buf_dev, sizeof(char) * re_s);
+            };
+            event copy_out = q.submit(cg);
+        }
+        n++;
+    }
+    q.wait();
+    
+    for (std::vector<void*>::iterator it = dev_p.begin();it != dev_p.end();it++) {
+        void* tmp = *it;
+        *it = nullptr;
+        free(tmp, q);
+    }
+}
+
+void WaveformXmode::execute(int para) {
     static auto exception_handler = [](sycl::exception_list e_list) {
         for (std::exception_ptr const& e : e_list) {
             try {
@@ -314,21 +448,12 @@ void WaveformXmode::execute() {
 
     // execute sort
     try {
-        int i = 0;
-        for (std::vector<int>::iterator it = this->xmode.begin(); it != this->xmode.end(); it++) {
-            if (*it != 0) {
-                if (this->res.at(i) != nullptr) {
-                    std::vector<char>* tmp = this->res.at(i);
-                    this->res.at(i) = nullptr;
-                    delete tmp;
-                }
-                std::vector<char>* re = new std::vector<char>(256 * (*it), 0);
-                this->res.at(i) = re;
-                wave_search(q, *(this->wave.at(i)), *it, *re);
-            }
-            i++;
+        if (para == 0) {
+            this->wave_search(q);
         }
-        q.wait();
+        else {
+            this->wave_search_p(q);
+        }
     }
     catch (std::exception const& e) {
         std::cerr << "An exception is caught for execute.\n";
@@ -472,7 +597,18 @@ void xmode(void* p, const char* num_list, int xmode) {
 
 void execute(void* p) {
     try {
-        ((WaveformXmode*)p)->execute();
+        ((WaveformXmode*)p)->execute(0);
+    }
+    catch (std::exception const& e) {
+        std::cerr << "An exception is caught for execute.\n";
+        std::cerr << "exception caught: " << e.what() << '\n';
+        terminate();
+    }
+}
+
+void execute_p(void* p) {
+    try {
+        ((WaveformXmode*)p)->execute(1);
     }
     catch (std::exception const& e) {
         std::cerr << "An exception is caught for execute.\n";

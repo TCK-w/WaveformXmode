@@ -12,6 +12,7 @@ dll.init.restype = ctypes.c_void_p
 dll.pattern_byline.argtypes = [ctypes.c_void_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p]
 dll.xmode.argtypes = [ctypes.c_void_p,ctypes.c_char_p,ctypes.c_int]
 dll.execute.argtypes = [ctypes.c_void_p]
+dll.execute_p.argtypes = [ctypes.c_void_p]
 dll.get_used.argtypes = [ctypes.c_void_p,ctypes.c_int]
 dll.get_used.restype = ctypes.c_void_p
 dll.get_pattern.argtypes = [ctypes.c_void_p,ctypes.c_char_p]
@@ -29,7 +30,8 @@ try:
     dll.pattern_byline(p, pat.encode("utf-8"), "#".encode("utf-8"), "END".encode("utf-8"))
     dll.xmode(p, "0,2,4,6,8,10,12,14,16,18".encode("utf-8"),4)
     dll.xmode(p, "1,3,5,7,9,11,13,15,17,19".encode("utf-8"),3)
-    dll.execute(p)
+    # dll.execute(p)
+    dll.execute_p(p)
 except Exception as e:
     print("execute error:",e)
 

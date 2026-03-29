@@ -34,11 +34,11 @@ This example has two patterns, each consisting of 12 characters. Notice, `#` is 
 01#
 01#
 ```
-If a waveform is set to consist of 4 characters, the search results are:
+If a waveform is set to consist of 4 characters(xmode=4), the search results are:
 * Column0 used: `0100`,`0000`
 * Column1 used: `0000`,`1111`
 > [!IMPORTANT]
-> The numbers of waveform combination cannot be greater than 256.
+> The numbers of waveform combinations cannot be greater than 256.
 
 ## How to use
 ### Code Description
@@ -60,12 +60,15 @@ If a waveform is set to consist of 4 characters, the search results are:
   
   - `num_list` used to choose the column by number. Example: "1,3,4".
 
-  - `xmode` can be set from `2` to `8`. If not, an exception is thrown.
+  - `xmode` can be set from `2` to `16`. If not, an exception is thrown.
 
 * `void execute(void* p);`
 
   - Execute the computation.
-  
+
+* `void execute_p(void* p);`
+
+  - Execute the calculation in parallel mode. (Overlap data transfer and computation)
   
 * `char* get_used(void* p, int num);`
 
